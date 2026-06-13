@@ -58,8 +58,10 @@
 #include "contrib_ops/cuda/llm/cutlass_type_conversion.h"
 #include "contrib_ops/cuda/llm/kernels/pre_quant_scale_kernel.h"
 #include "contrib_ops/cuda/llm/kernels/quantization.cuh"
+#include <cstdlib>
 #include "contrib_ops/cuda/llm/moe_gemm/common.h"
 #include "contrib_ops/cuda/llm/moe_gemm/moe_kernels.h"
+#include "contrib_ops/cuda/llm/moe_gemm/moe_gemv.h"
 #include "contrib_ops/cuda/llm/moe_gemm/moe_util_kernels.h"
 #include "contrib_ops/cuda/llm/moe_gemm/moe_gemm_activation_kernels.cuh"
 #include "contrib_ops/cuda/llm/moe_gemm/moe_gemm_utils.cuh"
@@ -71,6 +73,94 @@ using namespace onnxruntime::llm::kernels;
 using namespace onnxruntime::llm::common;
 
 namespace onnxruntime::llm::kernels::cutlass_kernels {
+
+// Master switch for the int4 MoE GEMV fast path.
+// Set ORT_DISABLE_MOE_GEMV=1 to fall back to the CUTLASS grouped GEMM.
+inline bool MoeGemvDisabledByEnv() {
+  static bool const disabled = []() {
+    char const* v = std::getenv("ORT_DISABLE_MOE_GEMV");
+    return v != nullptr && v[0] == '1';
+  }();
+  return disabled;
+}
+
+inline bool MoeGemvRejectedByProfiledInterSize(int64_t expanded_num_rows, int64_t inter_size) {
+  return expanded_num_rows > onnxruntime::llm::kernels::moe_gemv::kMaxProfiledExpandedRowsForSmallProblemDim &&
+         inter_size < onnxruntime::llm::kernels::moe_gemv::kMinProfiledProblemDimForExpandedRowsAbove4;
+}
+
+// Tries to run the fused interleaved-SwiGLU int4 per-channel MoE GEMV.
+// Returns true if it ran (output written). Returns false for unsupported type
+// combinations or group_size > 0 (block-wise not yet implemented here).
+template <typename T, typename WeightType, typename ScaleBiasType>
+bool tryLaunchMoeGemvInt4PerChannelInterleavedSwiGLU(
+    T const* input, WeightType const* weights, ScaleBiasType const* scales,
+    ScaleBiasType const* biases, T* output,
+    int64_t const* expert_first_token_offset, int num_experts_per_node,
+    int const* permuted_row_to_expert, int64_t expanded_num_rows,
+    int64_t inter_size, int64_t k, int sm, int group_size,
+    bool disabled, cutlass_kernels::ActivationParams activation_params, cudaStream_t stream) {
+  if constexpr (std::is_same_v<WeightType, cutlass::uint4b_t> &&
+                std::is_same_v<T, half> && std::is_same_v<ScaleBiasType, T>) {
+    if (disabled || MoeGemvDisabledByEnv() || group_size > 0) {
+      return false;
+    }
+    if (activation_params.swiglu_fusion != 1) {
+      return false;
+    }
+    if (activation_params.activation_type != ActivationType::Swiglu &&
+        activation_params.activation_type != ActivationType::SwigluBias) {
+      return false;
+    }
+    int64_t const n = inter_size * 2;
+    if (!onnxruntime::llm::kernels::moe_gemv::is_moe_gemv_supported(sm, expanded_num_rows, n, k)) {
+      return false;
+    }
+    onnxruntime::llm::kernels::moe_gemv::launch_moe_gemv_int4_per_channel_interleaved_swiglu<T>(
+        input, reinterpret_cast<uint8_t const*>(weights), scales, biases, output,
+        expert_first_token_offset, permuted_row_to_expert, num_experts_per_node,
+        expanded_num_rows, inter_size, k, sm, activation_params, stream);
+    return true;
+  } else {
+    (void)input; (void)weights; (void)scales; (void)biases; (void)output;
+    (void)expert_first_token_offset; (void)num_experts_per_node; (void)permuted_row_to_expert;
+    (void)expanded_num_rows; (void)inter_size; (void)k; (void)sm; (void)group_size;
+    (void)disabled; (void)activation_params; (void)stream;
+    return false;
+  }
+}
+
+// Tries to run the non-fused int4 per-channel MoE GEMV (activation applied separately).
+template <typename T, typename WeightType, typename ScaleBiasType>
+bool tryLaunchMoeGemvInt4PerChannel(
+    T const* input, WeightType const* weights, ScaleBiasType const* scales,
+    ScaleBiasType const* biases, T* output,
+    int64_t const* expert_first_token_offset, int num_experts_per_node,
+    int const* permuted_row_to_expert, int64_t expanded_num_rows,
+    int64_t n, int64_t k, int sm, int group_size,
+    bool disabled, cudaStream_t stream) {
+  if constexpr (std::is_same_v<WeightType, cutlass::uint4b_t> &&
+                std::is_same_v<T, half> && std::is_same_v<ScaleBiasType, T>) {
+    if (disabled || MoeGemvDisabledByEnv() || group_size > 0) {
+      return false;
+    }
+    if (!onnxruntime::llm::kernels::moe_gemv::is_moe_gemv_supported(sm, expanded_num_rows, n, k)) {
+      return false;
+    }
+    onnxruntime::llm::kernels::moe_gemv::launch_moe_gemv_int4_per_channel<T>(
+        input, reinterpret_cast<uint8_t const*>(weights), scales, biases, output,
+        expert_first_token_offset, permuted_row_to_expert, num_experts_per_node,
+        expanded_num_rows, n, k, sm, stream);
+    return true;
+  } else {
+    (void)input; (void)weights; (void)scales; (void)biases; (void)output;
+    (void)expert_first_token_offset; (void)num_experts_per_node; (void)permuted_row_to_expert;
+    (void)expanded_num_rows; (void)n; (void)k; (void)sm; (void)group_size;
+    (void)disabled; (void)stream;
+    return false;
+  }
+}
+
 /**
  * Takes the input maps and prepares the expanded maps for min latency
  * @param num_active_experts_per_node: Number of active experts on current node
@@ -2089,7 +2179,8 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, ScaleBiasType, Ena
     TmaWarpSpecializedGroupedGemmInput::ElementSF* fc2_fp4_act_flat, QuantParams quant_params, int64_t const num_rows,
     int64_t const expanded_num_rows, int64_t const hidden_size, int64_t const inter_size,
     int const num_experts_per_node, ActivationType fc1_activation_type, float const** alpha_scale_ptr_array,
-    bool bias_is_broadcast, cudaStream_t stream, cutlass_extensions::CutlassGemmConfig config,
+    int const* permuted_row_to_expert, bool bias_is_broadcast,
+    cudaStream_t stream, cutlass_extensions::CutlassGemmConfig config,
     ActivationParameters activation_params) {
   bool const using_tma_ws_gemm1 = gemm_runner.isTmaWarpSpecialized(config);
   bool const is_gated_activation = isGatedActivation(fc1_activation_type);
@@ -2206,26 +2297,53 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, ScaleBiasType, Ena
       alpha_scale_ptr_array = computeFP8DequantScale(
           alpha_scale_ptr_array, num_experts_per_node, quant_params.groupwise.fc1.alpha, stream);
     }
-    // Run the GEMM with activation function overridden with `Identity`, we do the activation separately
-    auto universal_input = GroupedGemmInput<T, WeightType, OutputType, OutputType>{input,
-                                                                                   total_tokens_including_expert, fc1_expert_weights,
-                                                                                   /*scales*/ quant_params.groupwise.group_size > 0
-                                                                                       ? static_cast<ScaleBiasType const*>(quant_params.groupwise.fc1.weight_scales)
-                                                                                       : fc1_int_scales,
-                                                                                   /*zeros*/ quant_params.groupwise.group_size > 0
-                                                                                       ? static_cast<ScaleBiasType const*>(quant_params.groupwise.fc1.weight_zeros)
-                                                                                       : nullptr,
-                                                                                   fc1_expert_biases, static_cast<OutputType*>(use_ampere_activation_fusion ? output : intermediate_result),
-                                                                                   alpha_scale_ptr_array, /*occupancy*/ nullptr,
-                                                                                   use_ampere_activation_fusion ? fc1_activation_type : ActivationType::Identity, expanded_num_rows,
-                                                                                   /*N*/ int64_t(fc1_out_size),
-                                                                                   /*K*/ hidden_size, num_experts_per_node, quant_params.groupwise.group_size, bias_is_broadcast,
-                                                                                   use_ampere_activation_fusion, stream, activation_params, config};
-    gemm_runner.moeGemmBiasAct(universal_input, TmaWarpSpecializedGroupedGemmInput{});
+    // Fast path: int4 per-channel MoE GEMV for small expanded-row counts (batch-1 decode).
+    // Disabled for Ampere activation fusion, non-broadcast bias, group_size > 0, and
+    // problem sizes outside the profiled range.
+    bool const gemv_disabled = use_ampere_activation_fusion || !bias_is_broadcast ||
+                               MoeGemvRejectedByProfiledInterSize(expanded_num_rows, inter_size);
+    ScaleBiasType const* fc1_scales_for_gemv =
+        quant_params.groupwise.group_size > 0
+            ? static_cast<ScaleBiasType const*>(quant_params.groupwise.fc1.weight_scales)
+            : fc1_int_scales;
+    int const gemv_group_size = quant_params.groupwise.group_size;
+
+    bool const fc1_did_fused_gemv = tryLaunchMoeGemvInt4PerChannelInterleavedSwiGLU<T, WeightType, ScaleBiasType>(
+        input, fc1_expert_weights, fc1_scales_for_gemv,
+        fc1_expert_biases, output, expert_first_token_offset, num_experts_per_node,
+        /*permuted_row_to_expert=*/nullptr, expanded_num_rows, inter_size, hidden_size,
+        onnxruntime::llm::common::getSMVersion(), gemv_group_size, gemv_disabled, activation_params, stream);
+
+    bool const fc1_did_gemv = fc1_did_fused_gemv ||
+        tryLaunchMoeGemvInt4PerChannel<T, WeightType, ScaleBiasType>(
+            input, fc1_expert_weights, fc1_scales_for_gemv,
+            fc1_expert_biases, static_cast<T*>(intermediate_result), expert_first_token_offset,
+            num_experts_per_node, /*permuted_row_to_expert=*/nullptr, expanded_num_rows,
+            static_cast<int64_t>(fc1_out_size), hidden_size,
+            onnxruntime::llm::common::getSMVersion(), gemv_group_size, gemv_disabled, stream);
+
+    if (!fc1_did_gemv) {
+      // CUTLASS grouped GEMM fallback.
+      auto universal_input = GroupedGemmInput<T, WeightType, OutputType, OutputType>{input,
+                                                                                     total_tokens_including_expert, fc1_expert_weights,
+                                                                                     /*scales*/ quant_params.groupwise.group_size > 0
+                                                                                         ? static_cast<ScaleBiasType const*>(quant_params.groupwise.fc1.weight_scales)
+                                                                                         : fc1_int_scales,
+                                                                                     /*zeros*/ quant_params.groupwise.group_size > 0
+                                                                                         ? static_cast<ScaleBiasType const*>(quant_params.groupwise.fc1.weight_zeros)
+                                                                                         : nullptr,
+                                                                                     fc1_expert_biases, static_cast<OutputType*>(use_ampere_activation_fusion ? output : intermediate_result),
+                                                                                     alpha_scale_ptr_array, /*occupancy*/ nullptr,
+                                                                                     use_ampere_activation_fusion ? fc1_activation_type : ActivationType::Identity, expanded_num_rows,
+                                                                                     /*N*/ int64_t(fc1_out_size),
+                                                                                     /*K*/ hidden_size, num_experts_per_node, quant_params.groupwise.group_size, bias_is_broadcast,
+                                                                                     use_ampere_activation_fusion, stream, activation_params, config};
+      gemm_runner.moeGemmBiasAct(universal_input, TmaWarpSpecializedGroupedGemmInput{});
+    }
 
     sync_check_cuda_error(stream);
 
-    if (!use_ampere_activation_fusion) {
+    if (!use_ampere_activation_fusion && !fc1_did_fused_gemv) {
       using GatedActOutputType = std::conditional_t<use_w4afp8, ScaleBiasType, T>;
       if (is_gated_activation) {
         doGatedActivation<GatedActOutputType, UnfusedGemmOutputType>(
@@ -2500,7 +2618,8 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, ScaleBiasType, Ena
                 expert_first_token_offset_, gemm1_tma_ws_input, fc1_expert_weights, fc1_expert_biases, num_valid_tokens_ptr,
                 fc1_int_scales, fc1_fp8_dequant, use_wfp4afp8 ? fc2_wfp4afp8_quant_scale : fc2_fp8_quant,
                 fc1_fp4_act_scale_, fc2_fp4_act_scale_, quant_params, num_rows, expanded_num_rows, hidden_size, inter_size,
-                num_experts_per_node, fc1_activation_type, alpha_scale_ptr_array_fc1_, /*bias_is_broadcast=*/true, stream, *gemm1_config_,
+                num_experts_per_node, fc1_activation_type, alpha_scale_ptr_array_fc1_,
+                /*permuted_row_to_expert=*/nullptr, /*bias_is_broadcast=*/true, stream, *gemm1_config_,
                 activation_params);
     sync_check_cuda_error(stream);
 
@@ -3314,6 +3433,7 @@ void GemmProfilerBackend::runProfiler(int original_num_tokens, Config const& tac
                       num_experts_per_node,                                                      //
                       mActivationType,                                                           //
                       alpha_scale_ptr_array,                                                     //
+                      nullptr,                                                                   // permuted_row_to_expert
                       true,                                                                      //
                       stream,                                                                    //
                       tactic,                                                                    //
