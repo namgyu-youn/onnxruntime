@@ -24,9 +24,10 @@ inline constexpr int64_t kMinProfiledProblemDim = 512;
 inline constexpr int64_t kMinProfiledProblemDimForExpandedRowsAbove4 = 704;
 
 // Returns true if the batched MoE GEMV fast path supports this problem shape.
-// Requirements: int4 per-channel weights, FP16 activations, sm >= 80,
-// small expanded_num_rows, and n divisible by the kernel tile width.
-bool is_moe_gemv_supported(int sm, int64_t expanded_num_rows, int64_t n, int64_t k);
+// Requirements: int4 weights, FP16 activations, sm >= 80, small expanded_num_rows,
+// n divisible by the kernel tile width, and group_size == 0 or group_size == 128.
+bool is_moe_gemv_supported(int sm, int64_t expanded_num_rows, int64_t n, int64_t k,
+                           int group_size = 0);
 
 // Launches the int4 per-channel MoE GEMV.
 //   act:    [expanded_num_rows, k]  permuted activations (row-major)
@@ -50,6 +51,22 @@ void launch_moe_gemv_int4_per_channel_interleaved_swiglu(
     T const* act, uint8_t const* weight, T const* scales, T const* bias, T* out,
     int64_t const* expert_first_token_offset, int const* permuted_row_to_expert, int num_experts,
     int64_t expanded_num_rows, int64_t inter_size, int64_t k, int sm,
+    cutlass_kernels::ActivationParams activation_params, cudaStream_t stream);
+
+// Launches the int4 block-wise (group_size=128) MoE GEMV.
+//   scales: [num_experts, k/group_size, n] (PrePack-transposed layout)
+template <typename T>
+void launch_moe_gemv_int4_block_wise(
+    T const* act, uint8_t const* weight, T const* scales, T const* bias, T* out,
+    int64_t const* expert_first_token_offset, int const* permuted_row_to_expert, int num_experts,
+    int64_t expanded_num_rows, int64_t n, int64_t k, int group_size, int sm, cudaStream_t stream);
+
+// Launches the int4 block-wise MoE GEMV with fused interleaved SwiGLU activation.
+template <typename T>
+void launch_moe_gemv_int4_block_wise_interleaved_swiglu(
+    T const* act, uint8_t const* weight, T const* scales, T const* bias, T* out,
+    int64_t const* expert_first_token_offset, int const* permuted_row_to_expert, int num_experts,
+    int64_t expanded_num_rows, int64_t inter_size, int64_t k, int group_size, int sm,
     cutlass_kernels::ActivationParams activation_params, cudaStream_t stream);
 
 }  // namespace moe_gemv

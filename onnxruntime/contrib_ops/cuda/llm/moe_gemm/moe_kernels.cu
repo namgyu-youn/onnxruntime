@@ -89,9 +89,9 @@ inline bool MoeGemvRejectedByProfiledInterSize(int64_t expanded_num_rows, int64_
          inter_size < onnxruntime::llm::kernels::moe_gemv::kMinProfiledProblemDimForExpandedRowsAbove4;
 }
 
-// Tries to run the fused interleaved-SwiGLU int4 per-channel MoE GEMV.
-// Returns true if it ran (output written). Returns false for unsupported type
-// combinations or group_size > 0 (block-wise not yet implemented here).
+// Tries to run the fused interleaved-SwiGLU int4 MoE GEMV (per-channel or block-wise).
+// Returns true if it ran. Returns false for unsupported type combinations or
+// unsupported group_size (only 0 and 128 are supported).
 template <typename T, typename WeightType, typename ScaleBiasType>
 bool tryLaunchMoeGemvInt4PerChannelInterleavedSwiGLU(
     T const* input, WeightType const* weights, ScaleBiasType const* scales,
@@ -102,7 +102,7 @@ bool tryLaunchMoeGemvInt4PerChannelInterleavedSwiGLU(
     bool disabled, cutlass_kernels::ActivationParams activation_params, cudaStream_t stream) {
   if constexpr (std::is_same_v<WeightType, cutlass::uint4b_t> &&
                 std::is_same_v<T, half> && std::is_same_v<ScaleBiasType, T>) {
-    if (disabled || MoeGemvDisabledByEnv() || group_size > 0) {
+    if (disabled || MoeGemvDisabledByEnv()) {
       return false;
     }
     if (activation_params.swiglu_fusion != 1) {
@@ -113,13 +113,20 @@ bool tryLaunchMoeGemvInt4PerChannelInterleavedSwiGLU(
       return false;
     }
     int64_t const n = inter_size * 2;
-    if (!onnxruntime::llm::kernels::moe_gemv::is_moe_gemv_supported(sm, expanded_num_rows, n, k)) {
+    if (!onnxruntime::llm::kernels::moe_gemv::is_moe_gemv_supported(sm, expanded_num_rows, n, k, group_size)) {
       return false;
     }
-    onnxruntime::llm::kernels::moe_gemv::launch_moe_gemv_int4_per_channel_interleaved_swiglu<T>(
-        input, reinterpret_cast<uint8_t const*>(weights), scales, biases, output,
-        expert_first_token_offset, permuted_row_to_expert, num_experts_per_node,
-        expanded_num_rows, inter_size, k, sm, activation_params, stream);
+    if (group_size > 0) {
+      onnxruntime::llm::kernels::moe_gemv::launch_moe_gemv_int4_block_wise_interleaved_swiglu<T>(
+          input, reinterpret_cast<uint8_t const*>(weights), scales, biases, output,
+          expert_first_token_offset, permuted_row_to_expert, num_experts_per_node,
+          expanded_num_rows, inter_size, k, group_size, sm, activation_params, stream);
+    } else {
+      onnxruntime::llm::kernels::moe_gemv::launch_moe_gemv_int4_per_channel_interleaved_swiglu<T>(
+          input, reinterpret_cast<uint8_t const*>(weights), scales, biases, output,
+          expert_first_token_offset, permuted_row_to_expert, num_experts_per_node,
+          expanded_num_rows, inter_size, k, sm, activation_params, stream);
+    }
     return true;
   } else {
     (void)input; (void)weights; (void)scales; (void)biases; (void)output;
@@ -130,7 +137,7 @@ bool tryLaunchMoeGemvInt4PerChannelInterleavedSwiGLU(
   }
 }
 
-// Tries to run the non-fused int4 per-channel MoE GEMV (activation applied separately).
+// Tries to run the non-fused int4 MoE GEMV (per-channel or block-wise).
 template <typename T, typename WeightType, typename ScaleBiasType>
 bool tryLaunchMoeGemvInt4PerChannel(
     T const* input, WeightType const* weights, ScaleBiasType const* scales,
@@ -141,16 +148,23 @@ bool tryLaunchMoeGemvInt4PerChannel(
     bool disabled, cudaStream_t stream) {
   if constexpr (std::is_same_v<WeightType, cutlass::uint4b_t> &&
                 std::is_same_v<T, half> && std::is_same_v<ScaleBiasType, T>) {
-    if (disabled || MoeGemvDisabledByEnv() || group_size > 0) {
+    if (disabled || MoeGemvDisabledByEnv()) {
       return false;
     }
-    if (!onnxruntime::llm::kernels::moe_gemv::is_moe_gemv_supported(sm, expanded_num_rows, n, k)) {
+    if (!onnxruntime::llm::kernels::moe_gemv::is_moe_gemv_supported(sm, expanded_num_rows, n, k, group_size)) {
       return false;
     }
-    onnxruntime::llm::kernels::moe_gemv::launch_moe_gemv_int4_per_channel<T>(
-        input, reinterpret_cast<uint8_t const*>(weights), scales, biases, output,
-        expert_first_token_offset, permuted_row_to_expert, num_experts_per_node,
-        expanded_num_rows, n, k, sm, stream);
+    if (group_size > 0) {
+      onnxruntime::llm::kernels::moe_gemv::launch_moe_gemv_int4_block_wise<T>(
+          input, reinterpret_cast<uint8_t const*>(weights), scales, biases, output,
+          expert_first_token_offset, permuted_row_to_expert, num_experts_per_node,
+          expanded_num_rows, n, k, group_size, sm, stream);
+    } else {
+      onnxruntime::llm::kernels::moe_gemv::launch_moe_gemv_int4_per_channel<T>(
+          input, reinterpret_cast<uint8_t const*>(weights), scales, biases, output,
+          expert_first_token_offset, permuted_row_to_expert, num_experts_per_node,
+          expanded_num_rows, n, k, sm, stream);
+    }
     return true;
   } else {
     (void)input; (void)weights; (void)scales; (void)biases; (void)output;
@@ -2297,9 +2311,10 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, ScaleBiasType, Ena
       alpha_scale_ptr_array = computeFP8DequantScale(
           alpha_scale_ptr_array, num_experts_per_node, quant_params.groupwise.fc1.alpha, stream);
     }
-    // Fast path: int4 per-channel MoE GEMV for small expanded-row counts (batch-1 decode).
-    // Disabled for Ampere activation fusion, non-broadcast bias, group_size > 0, and
-    // problem sizes outside the profiled range.
+    // Fast path: int4 MoE GEMV for small expanded-row counts (batch-1 decode).
+    // Supports per-channel (group_size==0) and block-wise (group_size==128, Qwen3.6).
+    // Disabled for Ampere activation fusion, non-broadcast bias, and problem sizes
+    // outside the profiled range.
     bool const gemv_disabled = use_ampere_activation_fusion || !bias_is_broadcast ||
                                MoeGemvRejectedByProfiledInterSize(expanded_num_rows, inter_size);
     ScaleBiasType const* fc1_scales_for_gemv =
@@ -2311,14 +2326,14 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, ScaleBiasType, Ena
     bool const fc1_did_fused_gemv = tryLaunchMoeGemvInt4PerChannelInterleavedSwiGLU<T, WeightType, ScaleBiasType>(
         input, fc1_expert_weights, fc1_scales_for_gemv,
         fc1_expert_biases, output, expert_first_token_offset, num_experts_per_node,
-        /*permuted_row_to_expert=*/nullptr, expanded_num_rows, inter_size, hidden_size,
+        permuted_row_to_expert, expanded_num_rows, inter_size, hidden_size,
         onnxruntime::llm::common::getSMVersion(), gemv_group_size, gemv_disabled, activation_params, stream);
 
     bool const fc1_did_gemv = fc1_did_fused_gemv ||
         tryLaunchMoeGemvInt4PerChannel<T, WeightType, ScaleBiasType>(
             input, fc1_expert_weights, fc1_scales_for_gemv,
             fc1_expert_biases, static_cast<T*>(intermediate_result), expert_first_token_offset,
-            num_experts_per_node, /*permuted_row_to_expert=*/nullptr, expanded_num_rows,
+            num_experts_per_node, permuted_row_to_expert, expanded_num_rows,
             static_cast<int64_t>(fc1_out_size), hidden_size,
             onnxruntime::llm::common::getSMVersion(), gemv_group_size, gemv_disabled, stream);
 
