@@ -110,7 +110,7 @@ GroupQueryAttention<T, U>::GroupQueryAttention(const OpKernelInfo& info)
   kv_cache_bit_width_ = static_cast<int>(info.GetAttrOrDefault<int64_t>("kv_cache_bit_width", 0));
 
   bool is_quantized = (k_quant_type_ != KVQuantizationType::NONE || v_quant_type_ != KVQuantizationType::NONE);
-  int default_enable_xqa = is_quantized ? 1 : 0;
+  int default_enable_xqa = 1;
   enable_xqa_ = (std::is_same_v<T, MLFloat16> || std::is_same_v<T, BFloat16>) && ParseEnvironmentVariableWithDefault<int>("ORT_ENABLE_XQA", default_enable_xqa) != 0;
 
   kernel_options_ = this->GetAttentionKernelOptions();
@@ -372,7 +372,8 @@ Status GroupQueryAttention<T, U>::ComputeInternal(OpKernelContext* context) cons
 
     bool is_non_quantized_supported = !is_inputs_quantized &&
                                       (parameters.head_size == 256 || parameters.head_size == 128 || parameters.head_size == 64) &&
-                                      (64 % group_size == 0);
+                                      (group_size == 1 || group_size == 2 || group_size == 4 || group_size == 5 ||
+                                       group_size == 8 || group_size == 16 || group_size == 32);
 
     data.use_xqa = (is_non_quantized_supported || is_int8_quantized_supported || is_fp8_quantized_supported);
 
