@@ -2699,7 +2699,11 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, ScaleBiasType, Enable>:
       TmaWarpSpecializedGroupedGemmInput::MXFPXElementSF weight_block_scale_value_int{};
 #ifdef ENABLE_FP8
       __nv_fp8_e8m0 tmp;
+#if CUDA_VERSION >= 12080
       tmp.__x = __nv_cvt_float_to_e8m0(1.0f, __NV_SATFINITE, cudaRoundPosInf);
+#else
+      tmp.__x = 0x7F;  // E8M0 representation of 1.0 (bias=127, value=2^(127-127)=1.0), fallback for CUDA < 12.8
+#endif
       std::memcpy(&weight_block_scale_value_int, &tmp, sizeof(tmp));
 #endif
 
