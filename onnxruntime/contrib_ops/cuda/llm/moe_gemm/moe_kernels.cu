@@ -2697,7 +2697,7 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, ScaleBiasType, Enable>:
                   "WFP4AFP8 expects the scaling factors to be aliased for gemm1 & gemm2");
 
       TmaWarpSpecializedGroupedGemmInput::MXFPXElementSF weight_block_scale_value_int{};
-#if defined(ENABLE_FP8) && CUDA_VERSION >= 12080
+#ifdef ENABLE_FP8
       __nv_fp8_e8m0 tmp;
       tmp.__x = __nv_cvt_float_to_e8m0(1.0f, __NV_SATFINITE, cudaRoundPosInf);
       std::memcpy(&weight_block_scale_value_int, &tmp, sizeof(tmp));
