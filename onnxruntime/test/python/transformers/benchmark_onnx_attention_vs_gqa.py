@@ -145,7 +145,9 @@ def create_attention_past_model(batch, q_heads, kv_heads, head_size, past_seq_le
     return model.SerializeToString()
 
 
-def create_attention_scatter_model(batch, q_heads, kv_heads, head_size, buffer_len, onnx_dtype, attention_only):
+def create_attention_scatter_model(
+    batch, q_heads, kv_heads, head_size, buffer_len, onnx_dtype, attention_only, cache_4d=False
+):
     """ONNX Attention (opset 24) external-cache decode graph.
 
     TensorScatter writes the new K/V token into the pre-allocated cache in
@@ -153,12 +155,29 @@ def create_attention_scatter_model(batch, q_heads, kv_heads, head_size, buffer_l
     inputs), then Attention consumes the full cache with nonpad_kv_seqlen.
     No present_key/present_value outputs. With attention_only=True the
     TensorScatter nodes are dropped and the bare Attention node is timed.
+
+    cache_4d=False keeps everything 3D: cache [B, S_buf, H_kv*D] (BSNH),
+    TensorScatter axis=1. cache_4d=True uses 4D BNSH: cache [B, H_kv, S_buf, D],
+    scatter axis=2, Q/output [B, H_q, 1, D] — per-head-contiguous cache reads
+    for the Flash kernel at the cost of Q/output transposes inside the op.
     """
     q_hidden = q_heads * head_size
     kv_hidden = kv_heads * head_size
 
+    scatter_axis = 2 if cache_4d else 1
+    if cache_4d:
+        cache_shape = [batch, kv_heads, buffer_len, head_size]
+        new_kv_shape = [batch, kv_heads, 1, head_size]
+        q_shape = [batch, q_heads, 1, head_size]
+        out_shape = [batch, q_heads, 1, head_size]
+    else:
+        cache_shape = [batch, buffer_len, kv_hidden]
+        new_kv_shape = [batch, 1, kv_hidden]
+        q_shape = [batch, 1, q_hidden]
+        out_shape = [batch, 1, q_hidden]
+
     nodes = []
-    outputs = [helper.make_tensor_value_info("output", onnx_dtype, [batch, 1, q_hidden])]
+    outputs = [helper.make_tensor_value_info("output", onnx_dtype, out_shape)]
     if attention_only:
         k_name, v_name = "key_cache", "value_cache"
     else:
@@ -169,7 +188,7 @@ def create_attention_scatter_model(batch, q_heads, kv_heads, head_size, buffer_l
                 inputs=["key_cache", "new_k", "write_indices"],
                 outputs=["updated_key_cache"],
                 name="TensorScatterKey",
-                axis=1,
+                axis=scatter_axis,
             )
         )
         nodes.append(
@@ -178,10 +197,9 @@ def create_attention_scatter_model(batch, q_heads, kv_heads, head_size, buffer_l
                 inputs=["value_cache", "new_v", "write_indices"],
                 outputs=["updated_value_cache"],
                 name="TensorScatterValue",
-                axis=1,
+                axis=scatter_axis,
             )
         )
-        cache_shape = [batch, buffer_len, kv_hidden]
         outputs.extend(
             [
                 helper.make_tensor_value_info("updated_key_cache", onnx_dtype, cache_shape),
@@ -205,16 +223,16 @@ def create_attention_scatter_model(batch, q_heads, kv_heads, head_size, buffer_l
     )
 
     graph_inputs = [
-        helper.make_tensor_value_info("key_cache", onnx_dtype, [batch, buffer_len, kv_hidden]),
-        helper.make_tensor_value_info("value_cache", onnx_dtype, [batch, buffer_len, kv_hidden]),
-        helper.make_tensor_value_info("query", onnx_dtype, [batch, 1, q_hidden]),
+        helper.make_tensor_value_info("key_cache", onnx_dtype, cache_shape),
+        helper.make_tensor_value_info("value_cache", onnx_dtype, cache_shape),
+        helper.make_tensor_value_info("query", onnx_dtype, q_shape),
         helper.make_tensor_value_info("nonpad_kv_seqlen", TensorProto.INT64, [batch]),
     ]
     if not attention_only:
         graph_inputs.extend(
             [
-                helper.make_tensor_value_info("new_k", onnx_dtype, [batch, 1, kv_hidden]),
-                helper.make_tensor_value_info("new_v", onnx_dtype, [batch, 1, kv_hidden]),
+                helper.make_tensor_value_info("new_k", onnx_dtype, new_kv_shape),
+                helper.make_tensor_value_info("new_v", onnx_dtype, new_kv_shape),
                 helper.make_tensor_value_info("write_indices", TensorProto.INT64, [batch]),
             ]
         )
@@ -302,40 +320,69 @@ def make_attn_past_arm(args, past_seq_len, torch_dtype, canonical=None):
 def make_attn_scatter_arm(args, past_seq_len, torch_dtype, canonical=None):
     onnx_dtype = TensorProto.FLOAT16 if torch_dtype == torch.float16 else TensorProto.BFLOAT16
     model = create_attention_scatter_model(
-        args.batch, args.q_heads, args.kv_heads, args.head_size, args.max_seq_len, onnx_dtype, args.attention_only
+        args.batch,
+        args.q_heads,
+        args.kv_heads,
+        args.head_size,
+        args.max_seq_len,
+        onnx_dtype,
+        args.attention_only,
+        args.cache_4d,
     )
     buffer_sharing = (
         None if args.attention_only else {"key_cache": "updated_key_cache", "value_cache": "updated_value_cache"}
     )
     session = create_cuda_session(model, args.device, buffer_sharing)
-    session.allocate_buffers({"output": (args.batch, 1, args.q_heads * args.head_size)})
+    if args.cache_4d:
+        session.allocate_buffers({"output": (args.batch, args.q_heads, 1, args.head_size)})
+    else:
+        session.allocate_buffers({"output": (args.batch, 1, args.q_heads * args.head_size)})
 
     if canonical is not None:
         q, past_k, past_v, new_k, new_v = canonical
     else:
         q, past_k, past_v, new_k, new_v = random_canonical_inputs(args, past_seq_len, torch_dtype)
 
-    # Cache layout is BSNH flattened to [batch, buffer_len, kv_hidden]; valid
-    # tokens occupy [0, past_seq_len) before the scatter appends position past_seq_len.
+    # Valid tokens occupy [0, past_seq_len) before the scatter appends position
+    # past_seq_len. 3D cache is BSNH flattened to [batch, buffer_len, kv_hidden];
+    # 4D cache is BNSH [batch, kv_heads, buffer_len, head_size].
     kv_hidden = args.kv_heads * args.head_size
-    key_cache = torch.zeros(args.batch, args.max_seq_len, kv_hidden, dtype=torch_dtype, device=args.device)
-    value_cache = torch.zeros_like(key_cache)
-    key_cache[:, :past_seq_len, :] = past_k.transpose(1, 2).reshape(args.batch, past_seq_len, kv_hidden)
-    value_cache[:, :past_seq_len, :] = past_v.transpose(1, 2).reshape(args.batch, past_seq_len, kv_hidden)
+    if args.cache_4d:
+        key_cache = torch.zeros(
+            args.batch, args.kv_heads, args.max_seq_len, args.head_size, dtype=torch_dtype, device=args.device
+        )
+        value_cache = torch.zeros_like(key_cache)
+        key_cache[:, :, :past_seq_len, :] = past_k
+        value_cache[:, :, :past_seq_len, :] = past_v
+        query = q.transpose(1, 2).contiguous()  # [B, 1, H, D] -> [B, H, 1, D]
+        new_k_feed = new_k.transpose(1, 2).contiguous()  # [B, 1, Hkv, D] -> [B, Hkv, 1, D]
+        new_v_feed = new_v.transpose(1, 2).contiguous()
+    else:
+        key_cache = torch.zeros(args.batch, args.max_seq_len, kv_hidden, dtype=torch_dtype, device=args.device)
+        value_cache = torch.zeros_like(key_cache)
+        key_cache[:, :past_seq_len, :] = past_k.transpose(1, 2).reshape(args.batch, past_seq_len, kv_hidden)
+        value_cache[:, :past_seq_len, :] = past_v.transpose(1, 2).reshape(args.batch, past_seq_len, kv_hidden)
+        query = q.reshape(args.batch, 1, -1).contiguous()
+        new_k_feed = new_k.reshape(args.batch, 1, -1).contiguous()
+        new_v_feed = new_v.reshape(args.batch, 1, -1).contiguous()
 
     feeds = {
         "key_cache": key_cache,
         "value_cache": value_cache,
-        "query": q.reshape(args.batch, 1, -1).contiguous(),
+        "query": query,
         "nonpad_kv_seqlen": torch.full((args.batch,), past_seq_len + 1, dtype=torch.int64, device=args.device),
     }
     if args.attention_only:
         # No scatter node: pre-place the new token in the cache directly.
-        feeds["key_cache"][:, past_seq_len, :] = new_k.reshape(args.batch, kv_hidden)
-        feeds["value_cache"][:, past_seq_len, :] = new_v.reshape(args.batch, kv_hidden)
+        if args.cache_4d:
+            feeds["key_cache"][:, :, past_seq_len, :] = new_k_feed.reshape(args.batch, args.kv_heads, args.head_size)
+            feeds["value_cache"][:, :, past_seq_len, :] = new_v_feed.reshape(args.batch, args.kv_heads, args.head_size)
+        else:
+            feeds["key_cache"][:, past_seq_len, :] = new_k_feed.reshape(args.batch, kv_hidden)
+            feeds["value_cache"][:, past_seq_len, :] = new_v_feed.reshape(args.batch, kv_hidden)
     else:
-        feeds["new_k"] = new_k.reshape(args.batch, 1, -1).contiguous()
-        feeds["new_v"] = new_v.reshape(args.batch, 1, -1).contiguous()
+        feeds["new_k"] = new_k_feed
+        feeds["new_v"] = new_v_feed
         feeds["write_indices"] = torch.full((args.batch,), past_seq_len, dtype=torch.int64, device=args.device)
     return session, feeds
 
@@ -516,6 +563,8 @@ def run_sanity(args):
     for arm in args.arms:
         session, feeds = build_arm(arm, args, past_seq_len, torch_dtype, canonical)
         result = session.infer(feeds)
+        # 3D arms emit [B, 1, H*D]; the 4D scatter variant emits BNSH [B, H, 1, D].
+        # Both flatten to the same head-major element order.
         outputs[arm] = result["output"].reshape(args.batch, 1, -1).float().cpu().clone()
         del session
         torch.cuda.empty_cache()
@@ -583,6 +632,11 @@ def main():
         "--attention-only",
         action="store_true",
         help="drop the TensorScatter nodes from the attn_scatter arm (attribution runs)",
+    )
+    parser.add_argument(
+        "--cache-4d",
+        action="store_true",
+        help="attn_scatter arm uses a 4D BNSH external cache (scatter axis=2) instead of 3D BSNH",
     )
     parser.add_argument("--csv", default=None, help="append results to this CSV file")
     parser.add_argument("--sanity", action="store_true", help="cross-arm output parity check, no timing")

@@ -71,15 +71,16 @@ timer's warmup.
 ./04_profile.sh
 ```
 
-One `nsys` capture per arm at past=2048 fp16, exported to sqlite. Attribution
-table per arm (issue gap items 3–4: launch counts, concat vs prep vs flash):
+One `nsys` capture per arm at past=2048 fp16, exported to sqlite, then a
+per-kernel table via `parse_kernels.py` (in this directory — the in-tree
+`parse_nsys.py` NVTX filter cannot see torch.cuda.nvtx ranges, which are
+unregistered strings):
 
 ```bash
-python ../onnxruntime/test/python/transformers/parse_nsys.py \
-    results/nsys_<arm>_fp16_p2048.sqlite --nvtx-range benchmark
+python parse_kernels.py results/nsys_<arm>_fp16_p2048.sqlite
 ```
 
-Divide `call_count` by 100 (profile iterations) for launches per decode step.
+It reports launches/step, avg µs, and µs/step per kernel (issue gap items 3–4).
 
 ## 4. Package results
 
