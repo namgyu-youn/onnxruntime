@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Decode-latency sweep, all four arms, fp16 + bf16, plus scatter-cost attribution run.
+# Decode-latency sweep, all arms, fp16 + bf16, plus scatter-cost attribution run.
 set -euo pipefail
 cd "$(dirname "$0")"
 source venv/bin/activate

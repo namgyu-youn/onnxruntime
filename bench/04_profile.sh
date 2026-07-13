@@ -17,10 +17,8 @@ for arm in gqa_xqa gqa_flash gqa_cudnn attn_past attn_scatter; do
       python benchmark_onnx_attention_vs_gqa.py \
       --profile --arms "$arm" --past-seq-len 2048 --dtype float16 --profile-iters 100) \
     2>&1 | tee "$RESULTS/profile_${arm}.log"
-  # parse_kernels.py (this dir) instead of the in-tree parse_nsys.py: the
-  # latter's NVTX filter only sees registered strings and misses
-  # torch.cuda.nvtx ranges; parse_kernels.py aggregates the whole capture and
-  # divides out the warmup instead.
+  # parse_kernels.py, not the in-tree parse_nsys.py: its NVTX filter cannot
+  # see torch.cuda.nvtx ranges.
   python parse_kernels.py "${out}.sqlite" \
     | tee "$RESULTS/kernels_${arm}_fp16_p2048.txt"
 done

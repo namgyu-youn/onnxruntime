@@ -7,7 +7,7 @@ XQA and Flash decode paths do not exist below Ampere).
 
 The benchmark itself lives in-tree (where the issue asks for it to be committed):
 `onnxruntime/test/python/transformers/benchmark_onnx_attention_vs_gqa.py`.
-See its module docstring for the four arms and the fairness rules.
+See its module docstring for the arms and the measurement rules.
 
 ## 0. Get the branch and environment
 
@@ -18,10 +18,9 @@ cd bench
 source venv/bin/activate
 ```
 
-If you already have a proven onnxruntime-gpu wheel for this machine (e.g. from
-the earlier RTX PRO 6000 runbooks), reuse it instead of the nightly — every log
-records `onnxruntime.get_build_info()`, so the wheel commit is captured either
-way. **Do not mix wheels between steps.**
+A local onnxruntime-gpu wheel can replace the nightly — every log records
+`onnxruntime.get_build_info()`, so the wheel commit is captured either way.
+**Do not mix wheels between steps.**
 
 Optional: `pip install triton` — the script then times with
 `triton.testing.do_bench` (same timer as the in-tree `benchmark_gqa.py`);
@@ -58,7 +57,7 @@ obvious) unfused kernel.
 ```
 
 Sweeps past KV length 128→4096 (Llama-3-8B decode shape: B=1, H=32, H_kv=8,
-head=128, KV buffer 8192) for fp16 and bf16, all four arms, plus an
+head=128, KV buffer 8192) for fp16 and bf16, all arms, plus an
 `--attention-only` attribution run of the external-cache arm (TensorScatter
 nodes removed, so scatter cost = difference between the two runs). Results:
 `results/sweep.csv`, `results/sweep_attn_only.csv`, and markdown tables in the

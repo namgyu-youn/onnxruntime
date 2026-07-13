@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """Per-kernel attribution for the #28352 profile captures.
 
-parse_nsys.py's NVTX-range filter does not see torch.cuda.nvtx ranges (they are
-unregistered strings, and async submission lets GPU timestamps drift past the
-host-side range windows), so this aggregates over the whole capture instead:
-the profiled config repeats warmup+profile_iters times, so after dropping each
-kernel's first `--skip-first` calls, launches-per-step = count / profile_iters.
+Aggregates over the whole capture (NVTX filtering is unreliable for
+torch.cuda.nvtx ranges): the profiled config repeats warmup+profile_iters
+times, so after dropping each kernel's first `--skip-first` calls,
+launches-per-step = count / iters.
 
 Usage: python parse_kernels.py capture.sqlite [--skip-first 20] [--iters 100]
 """

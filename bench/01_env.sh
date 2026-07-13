@@ -7,10 +7,9 @@ python3 -m venv venv
 source venv/bin/activate
 pip install --upgrade pip
 
-# Torch with CUDA. Must be the cu130 line: the ORT-Nightly onnxruntime-gpu
-# wheels link against CUDA 13 (libcudart.so.13), and the torch cu130 wheel's
-# nvidia-*-cu13 deps provide those libraries in-process. cu128 torch leaves
-# ORT failing to import (verified 2026-07-13, RTX PRO 6000 / driver 580.95).
+# Torch must be the cu130 line: nightly onnxruntime-gpu links against CUDA 13
+# (libcudart.so.13), provided in-process by the cu130 wheel's nvidia-*-cu13
+# deps. With cu128 torch, onnxruntime fails to import.
 pip install torch triton --index-url https://download.pytorch.org/whl/cu130
 # onnx pinned: gqa_test_helper.py stamps models with onnx's default opset, and
 # onnx 1.22 defaults to opset 27 which ORT (<=26) rejects at session load.
