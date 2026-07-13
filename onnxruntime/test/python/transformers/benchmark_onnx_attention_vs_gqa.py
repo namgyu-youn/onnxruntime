@@ -5,45 +5,34 @@
 
 """
 Benchmark ONNX Attention (opset 23/24, CUDA EP) against contrib GroupQueryAttention
-for single-stream decode, to give issue #28352 a reproducible baseline recipe.
+for single-stream decode (issue #28352 baseline recipe).
 
-Five arms, all decode-shaped (S_q = 1, causal, no RoPE, no mask, no softcap):
+Arms, all decode-shaped (S_q = 1, causal, no RoPE, no mask, no softcap):
 
-  gqa_xqa       com.microsoft GroupQueryAttention, shared KV buffer, XQA decode
-                kernel (default-on for fp16/bf16 on SM80+).
-  gqa_flash     Same op with ORT_ENABLE_XQA=0 and cuDNN SDPA pinned off, so
-                decode goes through the same Flash Attention kernels the ONNX
-                arms use, with GQA's fused UnpackRoPEAppend prep — the
-                like-for-like baseline for prep/cache-overhead attribution.
-  gqa_cudnn     Same op with ORT_ENABLE_XQA=0 and cuDNN SDPA left on: on SM90+
-                GQA auto-enables cuDNN flash attention when XQA is off
-                (group_query_attention.cc), so this is what non-XQA users
-                actually get on Hopper/Blackwell.
+  gqa_xqa       GroupQueryAttention, shared KV buffer, XQA decode kernel.
+  gqa_flash     GroupQueryAttention pinned to the Flash Attention kernels
+                (XQA and cuDNN SDPA disabled).
+  gqa_cudnn     GroupQueryAttention with XQA disabled and cuDNN SDPA enabled
+                (GQA's default non-XQA dispatch on SM90+).
   attn_past     ONNX Attention with past_key/past_value inputs and present_*
-                outputs (immutable-past spec path; full past copy per step via
-                LaunchConcatNewToPastKV).
-  attn_scatter  ONNX Attention opset 24 external-cache mode: TensorScatter
-                appends the new token in place, Attention consumes the full
-                cache with nonpad_kv_seqlen. present_* outputs are omitted —
-                requesting them adds a full-cache copy that no external-cache
-                deployment would pay.
+                outputs (LaunchConcatNewToPastKV copies the past each step).
+  attn_scatter  ONNX Attention opset-24 external cache: in-place TensorScatter
+                appends the new token, Attention reads the full cache with
+                nonpad_kv_seqlen. present_* outputs are omitted (requesting
+                them adds a full-cache copy).
 
-Notes on fairness:
-  - GQA does in-op cache append; the attn_scatter graph therefore includes the
-    TensorScatter nodes (in-place bound) so both arms pay their append cost.
-    Pass --attention-only to time the bare Attention node instead.
-  - ONNX arms run with ORT_DISABLE_MEMORY_EFFICIENT_ATTENTION=1 as a tripwire:
-    if Flash were silently ineligible the fallback would be the unfused kernel,
-    which is obvious in the numbers, instead of a quiet Flash->MEA flip.
-  - Run under ORT_ENABLE_ATTENTION_KERNEL_DEBUG_INFO=1 to print the resolved
-    GQA backend (including use_xqa). ONNX Attention has no debug print; verify
-    its backend from kernel names in an Nsight Systems capture (--profile).
-  - --max-seq-len (the KV buffer length) is a load-bearing knob for the
-    attn_scatter arm: in the nonpad_kv_seqlen path the true length is a device
-    tensor, so the host sizes the Flash split-KV launch from the buffer length
-    (attention.cc Path 1), and the kernel cost scales with the buffer rather
-    than the valid length. GQA sizes splits from its CPU-side
-    total_sequence_length input and does not have this behavior.
+Measurement notes:
+  - attn_scatter includes the TensorScatter nodes so both ops pay their cache
+    append; --attention-only times the bare Attention node instead.
+  - ONNX arms disable memory-efficient attention so a Flash ineligibility
+    surfaces as the (obviously slow) unfused kernel, never a silent MEA flip.
+  - ORT_ENABLE_ATTENTION_KERNEL_DEBUG_INFO=1 prints the resolved GQA backend.
+    ONNX Attention has no such print; verify it from kernel names in an
+    Nsight Systems capture (--profile).
+  - --max-seq-len (KV buffer length) directly affects attn_scatter latency:
+    the valid length is a device tensor, so the host sizes the Flash split-KV
+    launch from the buffer length (attention.cc, nonpad_kv_seqlen path). GQA
+    sizes splits from its CPU-side total_sequence_length input.
 
 Usage:
   python benchmark_onnx_attention_vs_gqa.py --dtype float16 --csv results.csv
@@ -77,17 +66,13 @@ except ImportError:
 
 ALL_ARMS = ["gqa_xqa", "gqa_flash", "gqa_cudnn", "attn_past", "attn_scatter"]
 
-ONNX_DTYPE = {"float16": TensorProto.FLOAT16, "bfloat16": TensorProto.BFLOAT16}
 TORCH_DTYPE = {"float16": torch.float16, "bfloat16": torch.bfloat16}
 
-# Env vars that pin attention kernel dispatch; recorded in provenance and set
-# per arm. They are read at session creation (AttentionKernelOptions is
-# initialized once per EP instance; ORT_ENABLE_XQA in the GQA op constructor),
-# so scoping them around InferenceSession construction is sufficient.
+# Kernel-dispatch pins per arm. ORT reads these at session creation, so they
+# are scoped around InferenceSession construction (see build_arm). cuDNN SDPA
+# must be pinned off for gqa_flash: SM90+ auto-enables it when XQA is off.
 ARM_ENV = {
     "gqa_xqa": {"ORT_ENABLE_XQA": "1"},
-    # cuDNN pinned off: without it GQA auto-enables cuDNN SDPA on SM90+, which
-    # would put this arm on a different kernel family than the ONNX arms.
     "gqa_flash": {"ORT_ENABLE_XQA": "0", "ORT_ENABLE_CUDNN_FLASH_ATTENTION": "0"},
     "gqa_cudnn": {"ORT_ENABLE_XQA": "0", "ORT_ENABLE_CUDNN_FLASH_ATTENTION": "1"},
     "attn_past": {"ORT_DISABLE_MEMORY_EFFICIENT_ATTENTION": "1"},
@@ -110,9 +95,7 @@ def scoped_env(env: dict):
 
 
 # #################################################################################################
-#  ONNX Attention graph builders (self-contained; the shared helpers in
-#  test_onnx_attention/common.py always emit present_* outputs, which the
-#  external-cache arm must not request)
+#  ONNX Attention graph builders
 # #################################################################################################
 
 
@@ -156,16 +139,14 @@ def create_attention_scatter_model(
 ):
     """ONNX Attention (opset 24) external-cache decode graph.
 
-    TensorScatter writes the new K/V token into the pre-allocated cache in
-    place (updated_* outputs are bound to the same buffers as the *_cache
-    inputs), then Attention consumes the full cache with nonpad_kv_seqlen.
-    No present_key/present_value outputs. With attention_only=True the
-    TensorScatter nodes are dropped and the bare Attention node is timed.
+    TensorScatter writes the new K/V token into the cache in place (updated_*
+    outputs are bound to the same buffers as the *_cache inputs), then
+    Attention consumes the full cache with nonpad_kv_seqlen. No present_*
+    outputs. attention_only=True drops the TensorScatter nodes.
 
-    cache_4d=False keeps everything 3D: cache [B, S_buf, H_kv*D] (BSNH),
-    TensorScatter axis=1. cache_4d=True uses 4D BNSH: cache [B, H_kv, S_buf, D],
-    scatter axis=2, Q/output [B, H_q, 1, D] — per-head-contiguous cache reads
-    for the Flash kernel at the cost of Q/output transposes inside the op.
+    cache_4d=False: 3D BSNH cache [B, S_buf, H_kv*D], scatter axis=1.
+    cache_4d=True: 4D BNSH cache [B, H_kv, S_buf, D], scatter axis=2,
+    Q/output [B, H_q, 1, D].
     """
     q_hidden = q_heads * head_size
     kv_hidden = kv_heads * head_size
@@ -451,9 +432,8 @@ def event_bench(fn, warmup=20, rep=100):
 
 def bench_arm(session, feeds):
     def run():
-        # synchronize=False: all work is on torch's current stream (the session
-        # was created with that stream), so the CUDA-event timers see it without
-        # per-call host syncs.
+        # The session runs on torch's current stream, so CUDA-event timers see
+        # its work without per-call host syncs.
         session.infer(feeds, synchronize=False)
 
     if do_bench is not None:
@@ -576,9 +556,8 @@ def run_sanity(args):
         torch.cuda.empty_cache()
 
     reference_arm = args.arms[0]
-    # Cross-kernel (XQA vs Flash vs concat+Flash) comparison on identical inputs;
-    # looser than the vs-fp32-reference tolerances in test_gqa.py since both
-    # sides are half precision. Gross config drift shows up as O(0.1+) diffs.
+    # Cross-kernel comparison of half-precision outputs; config drift shows up
+    # as O(0.1+) diffs, far above these thresholds.
     threshold = 1e-2 if args.dtype == "float16" else 5e-2
     print(f"## Sanity: cross-arm output parity at past_seq_len={past_seq_len}, dtype={args.dtype}")
     print(f"(reference arm: {reference_arm}; max |diff| threshold {threshold})")
@@ -608,8 +587,6 @@ def run_profile(args):
         session.infer(feeds, synchronize=False)
     torch.cuda.synchronize()
 
-    # One NVTX range instance named "benchmark" per iteration: parse_nsys.py
-    # filters by exact range name, so keep it constant across iterations.
     for _ in range(args.profile_iters):
         torch.cuda.nvtx.range_push("benchmark")
         session.infer(feeds, synchronize=False)
@@ -617,7 +594,7 @@ def run_profile(args):
     torch.cuda.synchronize()
     print(
         f"Profiled {args.profile_iters} iterations of {arm} at past_seq_len={args.past_seq_len} "
-        f"(dtype={args.dtype}); NVTX range name 'benchmark' (use parse_nsys.py --nvtx-range benchmark)."
+        f"(dtype={args.dtype}), after 20 warmup iterations; NVTX range name 'benchmark'."
     )
 
 
