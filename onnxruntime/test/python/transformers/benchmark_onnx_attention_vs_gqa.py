@@ -7,7 +7,7 @@
 Benchmark ONNX Attention (opset 23/24, CUDA EP) against contrib GroupQueryAttention
 for single-stream decode, to give issue #28352 a reproducible baseline recipe.
 
-Four arms, all decode-shaped (S_q = 1, causal, no RoPE, no mask, no softcap):
+Five arms, all decode-shaped (S_q = 1, causal, no RoPE, no mask, no softcap):
 
   gqa_xqa       com.microsoft GroupQueryAttention, shared KV buffer, XQA decode
                 kernel (default-on for fp16/bf16 on SM80+).
@@ -38,6 +38,12 @@ Notes on fairness:
   - Run under ORT_ENABLE_ATTENTION_KERNEL_DEBUG_INFO=1 to print the resolved
     GQA backend (including use_xqa). ONNX Attention has no debug print; verify
     its backend from kernel names in an Nsight Systems capture (--profile).
+  - --max-seq-len (the KV buffer length) is a load-bearing knob for the
+    attn_scatter arm: in the nonpad_kv_seqlen path the true length is a device
+    tensor, so the host sizes the Flash split-KV launch from the buffer length
+    (attention.cc Path 1), and the kernel cost scales with the buffer rather
+    than the valid length. GQA sizes splits from its CPU-side
+    total_sequence_length input and does not have this behavior.
 
 Usage:
   python benchmark_onnx_attention_vs_gqa.py --dtype float16 --csv results.csv
