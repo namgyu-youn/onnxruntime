@@ -11,8 +11,14 @@ Four arms, all decode-shaped (S_q = 1, causal, no RoPE, no mask, no softcap):
 
   gqa_xqa       com.microsoft GroupQueryAttention, shared KV buffer, XQA decode
                 kernel (default-on for fp16/bf16 on SM80+).
-  gqa_flash     Same op with ORT_ENABLE_XQA=0, so decode goes through Flash
-                Attention with the fused UnpackRoPEAppend prep.
+  gqa_flash     Same op with ORT_ENABLE_XQA=0 and cuDNN SDPA pinned off, so
+                decode goes through the same Flash Attention kernels the ONNX
+                arms use, with GQA's fused UnpackRoPEAppend prep — the
+                like-for-like baseline for prep/cache-overhead attribution.
+  gqa_cudnn     Same op with ORT_ENABLE_XQA=0 and cuDNN SDPA left on: on SM90+
+                GQA auto-enables cuDNN flash attention when XQA is off
+                (group_query_attention.cc), so this is what non-XQA users
+                actually get on Hopper/Blackwell.
   attn_past     ONNX Attention with past_key/past_value inputs and present_*
                 outputs (immutable-past spec path; full past copy per step via
                 LaunchConcatNewToPastKV).
@@ -63,7 +69,7 @@ except ImportError:
     do_bench = None
     TIMER = "cuda-event fallback (20 warmup iters, 100 timed iters, mean)"
 
-ALL_ARMS = ["gqa_xqa", "gqa_flash", "attn_past", "attn_scatter"]
+ALL_ARMS = ["gqa_xqa", "gqa_flash", "gqa_cudnn", "attn_past", "attn_scatter"]
 
 ONNX_DTYPE = {"float16": TensorProto.FLOAT16, "bfloat16": TensorProto.BFLOAT16}
 TORCH_DTYPE = {"float16": torch.float16, "bfloat16": torch.bfloat16}
@@ -74,7 +80,10 @@ TORCH_DTYPE = {"float16": torch.float16, "bfloat16": torch.bfloat16}
 # so scoping them around InferenceSession construction is sufficient.
 ARM_ENV = {
     "gqa_xqa": {"ORT_ENABLE_XQA": "1"},
-    "gqa_flash": {"ORT_ENABLE_XQA": "0"},
+    # cuDNN pinned off: without it GQA auto-enables cuDNN SDPA on SM90+, which
+    # would put this arm on a different kernel family than the ONNX arms.
+    "gqa_flash": {"ORT_ENABLE_XQA": "0", "ORT_ENABLE_CUDNN_FLASH_ATTENTION": "0"},
+    "gqa_cudnn": {"ORT_ENABLE_XQA": "0", "ORT_ENABLE_CUDNN_FLASH_ATTENTION": "1"},
     "attn_past": {"ORT_DISABLE_MEMORY_EFFICIENT_ATTENTION": "1"},
     "attn_scatter": {"ORT_DISABLE_MEMORY_EFFICIENT_ATTENTION": "1"},
 }
@@ -357,6 +366,7 @@ def random_canonical_inputs(args, past_seq_len, torch_dtype):
 ARM_BUILDERS = {
     "gqa_xqa": make_gqa_arm,
     "gqa_flash": make_gqa_arm,
+    "gqa_cudnn": make_gqa_arm,
     "attn_past": make_attn_past_arm,
     "attn_scatter": make_attn_scatter_arm,
 }

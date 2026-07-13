@@ -11,7 +11,7 @@ mkdir -p "$RESULTS"
 command -v nsys >/dev/null || { echo "nsys not found; install Nsight Systems CLI"; exit 1; }
 
 export ORT_ENABLE_ATTENTION_KERNEL_DEBUG_INFO=1
-for arm in gqa_xqa gqa_flash attn_past attn_scatter; do
+for arm in gqa_xqa gqa_flash gqa_cudnn attn_past attn_scatter; do
   out="$RESULTS/nsys_${arm}_fp16_p2048"
   (cd "$BENCH" && nsys profile -o "$out" --export=sqlite --force-overwrite true \
       python benchmark_onnx_attention_vs_gqa.py \
