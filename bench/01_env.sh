@@ -18,7 +18,8 @@ pip install 'onnx==1.21.*' numpy packaging wheel setuptools psutil cmake ninja
 # Override CUDA_HOME / CUDNN_HOME if the box's install is elsewhere.
 CUDA_HOME="${CUDA_HOME:-/usr/local/cuda}"
 CUDNN_HOME="${CUDNN_HOME:-/usr}"
-(cd .. && ./build.sh --config Release --build_dir build/cuda_29715 --parallel \
+ROOT_FLAG=$([ "$(id -u)" = 0 ] && echo --allow_running_as_root || true)
+(cd .. && ./build.sh --config Release --build_dir build/cuda_29715 --parallel $ROOT_FLAG \
     --use_cuda --cuda_home "$CUDA_HOME" --cudnn_home "$CUDNN_HOME" \
     --build_wheel --skip_tests --compile_no_warning_as_error \
     --cmake_extra_defines CMAKE_CUDA_ARCHITECTURES=native onnxruntime_BUILD_UNIT_TESTS=OFF)
