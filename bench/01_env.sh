@@ -8,11 +8,11 @@ python3 -m venv venv
 source venv/bin/activate
 pip install --upgrade pip
 
-# torch provides tensors/streams only; any recent cu12x/cu13x index works.
-pip install torch triton --index-url https://download.pytorch.org/whl/cu130
+# torch provides tensors/streams only; match the index to the box's CUDA major.
+pip install torch triton --index-url https://download.pytorch.org/whl/cu128
 # onnx pinned: gqa_test_helper.py stamps models with onnx's default opset, and
 # onnx 1.22 defaults to opset 27 which ORT (<=26) rejects at session load.
-pip install 'onnx==1.21.*' numpy packaging wheel setuptools psutil
+pip install 'onnx==1.21.*' numpy packaging wheel setuptools psutil cmake ninja
 
 # Wheel from this branch; =native restricts the build to this GPU (~30-60 min).
 # Override CUDA_HOME / CUDNN_HOME if the box's install is elsewhere.
